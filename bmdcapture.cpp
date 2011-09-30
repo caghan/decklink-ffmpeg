@@ -31,11 +31,14 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <math.h>
 
 #include "DeckLinkAPI.h"
 #include "Capture.h"
 extern "C" {
 #include "libavformat/avformat.h"
+#include "libswscale/swscale.h"
+#include "libavutil/mathematics.h"
 }
 
 pthread_mutex_t                    sleepMutex;
@@ -182,17 +185,17 @@ static int avpacket_queue_size(AVPacketQueue *q)
 AVFrame *picture;
 AVOutputFormat *fmt = NULL;
 AVFormatContext *oc;
-AVStream *audio_st, *video_st;
+AVStream *audio_st, *audio_st_1,*audio_st_2,*audio_st_3, *video_st;
 BMDTimeValue frameRateDuration, frameRateScale;
 
 
-static AVStream *add_audio_stream(AVFormatContext *oc, enum CodecID codec_id)
+static AVStream *add_audio_stream(AVFormatContext *oc, enum CodecID codec_id, int s_id)
 {
     AVCodecContext *c;
     AVCodec *codec;
     AVStream *st;
 
-    st = av_new_stream(oc, 1);
+    st = av_new_stream(oc, s_id);
     if (!st) {
         fprintf(stderr, "Could not alloc stream\n");
         exit(1);
@@ -204,7 +207,7 @@ static AVStream *add_audio_stream(AVFormatContext *oc, enum CodecID codec_id)
 
     /* put sample parameters */
     c->sample_fmt = SAMPLE_FMT_S16;
-//    c->bit_rate = 64000;
+    //c->bit_rate = 64000;
     c->sample_rate = 48000;
     c->channels = 2;
     // some formats want stream headers to be separate
@@ -218,12 +221,14 @@ static AVStream *add_audio_stream(AVFormatContext *oc, enum CodecID codec_id)
     }
 
     if (avcodec_open(c, codec) < 0) {
-        fprintf(stderr, "could not open codec\n");
+        fprintf(stderr, "Line: 230 could not open codec\n");
         exit(1);
     }
 
     return st;
 }
+
+
 
 static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
 {
@@ -268,7 +273,7 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
 
     /* open the codec */
     if (avcodec_open(c, codec) < 0) {
-        fprintf(stderr, "could not open codec\n");
+        fprintf(stderr, "Line 373: could not open codec\n");
         exit(1);
     }
     picture = avcodec_alloc_frame();
@@ -310,10 +315,65 @@ ULONG DeckLinkCaptureDelegate::Release(void)
     return (ULONG)m_refCount;
 }
 
+HRESULT add_pkt( IDeckLinkAudioInputPacket* audioFrame, uint32_t uiSelChannelNumber, AVCodecContext* codec, BMDTimeScale timeScale, int64_t timeNum, int index)
+{
+	void *audioFrameBytes;
+        if (uiSelChannelNumber > g_audioChannels) {
+	        return E_INVALIDARG;
+        }
+
+	AVCodecContext *c;
+	AVPacket pkt;
+        BMDTimeValue audio_pts;
+	
+	av_init_packet(&pkt);
+
+	c = codec;//audio_st->codec
+        //hack among hacks
+        uint32_t uiAudioFrameCount = audioFrame->GetSampleFrameCount();
+        uint32_t uiOrgBytesInChannels = g_audioChannels * (g_audioSampleDepth / 8);
+        uint32_t uiOrgSize = uiAudioFrameCount * uiOrgBytesInChannels;
+
+        audioFrame->GetBytes(&audioFrameBytes);
+	// uiSelChannelNumber allocate buffer
+        uint32_t uiNewBytesInChannel = 2 * (g_audioSampleDepth / 8); // 2 for streo audio
+        uint32_t uiNewSize = uiAudioFrameCount * uiNewBytesInChannel;
+        uint8_t *audioNewFrameBytes = (uint8_t*)malloc(uiNewSize); // store buffer space
+        if (!audioNewFrameBytes) {
+                return E_OUTOFMEMORY;
+        }
+        uint8_t *audioOrgFrameBytes = (uint8_t*)audioFrameBytes; // orginal start address
+        audioFrameBytes = (void*)audioNewFrameBytes; // new data start address
+        for (uint32_t i = 0; i < uiAudioFrameCount; i++) {
+        	uint8_t *pSelChannelBytes = audioOrgFrameBytes + (uiSelChannelNumber * uiNewBytesInChannel);
+                // copy original audio to selected 2 audio channel
+                memcpy((void*)audioNewFrameBytes, (const void*)pSelChannelBytes, uiNewBytesInChannel);
+                audioNewFrameBytes += uiNewBytesInChannel; // change to new audio channel
+                audioOrgFrameBytes += uiOrgBytesInChannels; // change to new audio group
+        }
+	// get time stamp
+        audioFrame->GetPacketTime(&audio_pts, timeScale);//audio_st->time_base.den);
+        // DTS & PTS are the same
+        pkt.dts = pkt.pts = audio_pts / timeNum; //audio_st->time_base.num;
+        // AV_PKT_FLAG_KEY for sync
+        pkt.flags |= AV_PKT_FLAG_KEY;
+
+        pkt.stream_index= index;//audio_st->index;
+        pkt.data = (uint8_t *)audioFrameBytes;
+        pkt.size = uiNewSize;
+        c->frame_number++;
+        avpacket_queue_put(&queue, &pkt);
+        // free the space for audioFrameBytes
+        free(audioFrameBytes);
+
+}
+
+
 HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(IDeckLinkVideoInputFrame* videoFrame, IDeckLinkAudioInputPacket* audioFrame)
 {
     void *frameBytes;
     void *audioFrameBytes;
+    uint16_t *buffer;
     BMDTimeValue frameTime;
     BMDTimeValue frameDuration;
 
@@ -362,33 +422,25 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(IDeckLinkVideoInputFrame
     // Handle Audio Frame
     if (audioFrame)
     {
-            AVCodecContext *c;
-            AVPacket pkt;
-	    BMDTimeValue audio_pts;
-            av_init_packet(&pkt);
+	add_pkt(audioFrame,0,audio_st->codec,audio_st->time_base.den,audio_st->time_base.num, audio_st->index); 
+	add_pkt(audioFrame,1,audio_st_1->codec,audio_st_1->time_base.den,audio_st_1->time_base.num,audio_st_1->index); 
+	add_pkt(audioFrame,2,audio_st_2->codec,audio_st_2->time_base.den,audio_st_2->time_base.num, audio_st_2->index); 
+	add_pkt(audioFrame,3,audio_st_3->codec,audio_st_3->time_base.den,audio_st_3->time_base.num,audio_st_3->index); 
 
-            c = audio_st->codec;
-            //hack among hacks
-            pkt.size =  audioFrame->GetSampleFrameCount() *
-                             g_audioChannels * (g_audioSampleDepth / 8);
-            audioFrame->GetBytes(&audioFrameBytes);
-            audioFrame->GetPacketTime(&audio_pts, audio_st->time_base.den);
-	    pkt.dts = pkt.pts= audio_pts/audio_st->time_base.num;
-	    //fprintf(stderr,"Audio Frame size %d ts %d\n", pkt.size, pkt.pts);
-            pkt.flags |= AV_PKT_FLAG_KEY;
-            pkt.stream_index= audio_st->index;
-            pkt.data = (uint8_t *)audioFrameBytes;
-//            pkt.size= avcodec_encode_audio(c, audio_outbuf, audio_outbuf_size, samples);
-	    c->frame_number++;
-            //write(audioOutputFile, audioFrameBytes, audioFrame->GetSampleFrameCount() * g_audioChannels * (g_audioSampleDepth / 8));
-/*            if (av_interleaved_write_frame(oc, &pkt) != 0) {
-                fprintf(stderr, "Error while writing audio frame\n");
-                exit(1);
-            } */
-            avpacket_queue_put(&queue, &pkt);
+
+
+//            av_init_packet(&pkt);
+
+
+
+
+
     }
     return S_OK;
 }
+
+
+
 
 HRESULT DeckLinkCaptureDelegate::VideoInputFormatChanged(BMDVideoInputFormatChangedEvents events, IDeckLinkDisplayMode *mode, BMDDetectedVideoInputFormatFlags)
 {
@@ -722,12 +774,16 @@ int main(int argc, char *argv[])
     fmt->audio_codec = CODEC_ID_PCM_S16LE;
 
     video_st = add_video_stream(oc, fmt->video_codec);
-    audio_st = add_audio_stream(oc, fmt->audio_codec);
+    audio_st = add_audio_stream(oc, fmt->audio_codec,1);
+    audio_st_1 = add_audio_stream(oc, fmt->audio_codec,2);
+    audio_st_2 = add_audio_stream(oc, fmt->audio_codec,3);
+    audio_st_3 = add_audio_stream(oc, fmt->audio_codec,4);
 
     av_set_parameters(oc, NULL);
 
     if (!(fmt->flags & AVFMT_NOFILE)) {
         if (avio_open(&oc->pb, oc->filename, AVIO_FLAG_WRITE) < 0) {
+//        if (url_open(&oc->pb, oc->filename, AVIO_WRONGLY) < 0) {
             fprintf(stderr, "Could not open '%s'\n", oc->filename);
             exit(1);
         }
@@ -801,6 +857,7 @@ bail:
         if (!(fmt->flags & AVFMT_NOFILE)) {
             /* close the output file */
             avio_close(oc->pb);
+            //url_close(oc->pb);
         }
 
     }
