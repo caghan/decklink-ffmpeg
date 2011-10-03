@@ -56,9 +56,10 @@ IDeckLinkConfiguration		  *deckLinkConfiguration;
 static int                        g_videoModeIndex = -1;
 static int                        g_audioChannels = 2;
 static int                        g_audioSampleDepth = 16;
-const char *                    g_videoOutputFile = NULL;
-const char *                    g_audioOutputFile = NULL;
+const char *                      g_videoOutputFile = NULL;
+const char *                      g_audioOutputFile = NULL;
 static int                        g_maxFrames = -1;
+static int			  g_audioStreams = 1;//Desired stereo audio stream count. By default 1.
 
 static unsigned long             frameCount = 0;
 static unsigned int             dropped = 0, totaldropped = 0;
@@ -185,7 +186,7 @@ static int avpacket_queue_size(AVPacketQueue *q)
 AVFrame *picture;
 AVOutputFormat *fmt = NULL;
 AVFormatContext *oc;
-AVStream *audio_st, *audio_st_1,*audio_st_2,*audio_st_3, *video_st;
+AVStream *audio_st_0, *audio_st_1,*audio_st_2,*audio_st_3, *audio_st_4, *audio_st_5, *audio_st_6, *audio_st_7, *video_st;
 BMDTimeValue frameRateDuration, frameRateScale;
 
 
@@ -245,7 +246,6 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum CodecID codec_id)
     c = st->codec;
     c->codec_id = codec_id;
     c->codec_type = AVMEDIA_TYPE_VIDEO;
-
     /* put sample parameters */
 //    c->bit_rate = 400000;
     /* resolution must be a multiple of two */
@@ -315,7 +315,7 @@ ULONG DeckLinkCaptureDelegate::Release(void)
     return (ULONG)m_refCount;
 }
 
-HRESULT add_pkt( IDeckLinkAudioInputPacket* audioFrame, uint32_t uiSelChannelNumber, AVCodecContext* codec, BMDTimeScale timeScale, int64_t timeNum, int index)
+HRESULT add_stereo_pkt( IDeckLinkAudioInputPacket* audioFrame, uint32_t uiSelChannelNumber, AVCodecContext* codec, BMDTimeScale timeScale, int64_t timeNum, int index)
 {
 	void *audioFrameBytes;
         if (uiSelChannelNumber > g_audioChannels) {
@@ -325,11 +325,10 @@ HRESULT add_pkt( IDeckLinkAudioInputPacket* audioFrame, uint32_t uiSelChannelNum
 	AVCodecContext *c;
 	AVPacket pkt;
         BMDTimeValue audio_pts;
-	
 	av_init_packet(&pkt);
 
-	c = codec;//audio_st->codec
-        //hack among hacks
+	c = codec;
+	//hack among hacks for 4 byte shift to handel each audio channel
         uint32_t uiAudioFrameCount = audioFrame->GetSampleFrameCount();
         uint32_t uiOrgBytesInChannels = g_audioChannels * (g_audioSampleDepth / 8);
         uint32_t uiOrgSize = uiAudioFrameCount * uiOrgBytesInChannels;
@@ -351,20 +350,15 @@ HRESULT add_pkt( IDeckLinkAudioInputPacket* audioFrame, uint32_t uiSelChannelNum
                 audioNewFrameBytes += uiNewBytesInChannel; // change to new audio channel
                 audioOrgFrameBytes += uiOrgBytesInChannels; // change to new audio group
         }
-	// get time stamp
-        audioFrame->GetPacketTime(&audio_pts, timeScale);//audio_st->time_base.den);
-        // DTS & PTS are the same
-        pkt.dts = pkt.pts = audio_pts / timeNum; //audio_st->time_base.num;
-        // AV_PKT_FLAG_KEY for sync
-        pkt.flags |= AV_PKT_FLAG_KEY;
-
-        pkt.stream_index= index;//audio_st->index;
+        audioFrame->GetPacketTime(&audio_pts, timeScale);// get time stamp
+        pkt.dts = pkt.pts = audio_pts / timeNum;
+        pkt.flags |= AV_PKT_FLAG_KEY;// AV_PKT_FLAG_KEY for sync
+        pkt.stream_index= index;
         pkt.data = (uint8_t *)audioFrameBytes;
         pkt.size = uiNewSize;
         c->frame_number++;
         avpacket_queue_put(&queue, &pkt);
-        // free the space for audioFrameBytes
-        free(audioFrameBytes);
+        free(audioFrameBytes);// free the space for audioFrameBytes
 
 }
 
@@ -422,19 +416,32 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(IDeckLinkVideoInputFrame
     // Handle Audio Frame
     if (audioFrame)
     {
-	add_pkt(audioFrame,0,audio_st->codec,audio_st->time_base.den,audio_st->time_base.num, audio_st->index); 
-	add_pkt(audioFrame,1,audio_st_1->codec,audio_st_1->time_base.den,audio_st_1->time_base.num,audio_st_1->index); 
-	add_pkt(audioFrame,2,audio_st_2->codec,audio_st_2->time_base.den,audio_st_2->time_base.num, audio_st_2->index); 
-	add_pkt(audioFrame,3,audio_st_3->codec,audio_st_3->time_base.den,audio_st_3->time_base.num,audio_st_3->index); 
-
-
-
-//            av_init_packet(&pkt);
-
-
-
-
-
+	
+	add_stereo_pkt(audioFrame, 0, audio_st_0->codec, audio_st_0->time_base.den, audio_st_0->time_base.num, audio_st_0->index); 
+	//XXX a dirty hack for command line utility -S. need to be implemented with a container and dynamic.
+	switch(g_audioStreams){
+		case 2:	
+		    add_stereo_pkt(audioFrame, 1, audio_st_1->codec, audio_st_1->time_base.den, audio_st_1->time_base.num, audio_st_1->index); 
+	            break;
+		case 3:
+		    add_stereo_pkt(audioFrame, 2, audio_st_2->codec, audio_st_2->time_base.den, audio_st_2->time_base.num, audio_st_2->index); 
+	            break;
+		case 4:
+		    add_stereo_pkt(audioFrame, 3, audio_st_3->codec, audio_st_3->time_base.den, audio_st_3->time_base.num, audio_st_3->index); 
+	            break;
+		case 5:	
+		    add_stereo_pkt(audioFrame, 4, audio_st_4->codec, audio_st_4->time_base.den, audio_st_4->time_base.num, audio_st_4->index); 
+	            break;
+		case 6:
+		    add_stereo_pkt(audioFrame, 5, audio_st_5->codec, audio_st_5->time_base.den, audio_st_5->time_base.num, audio_st_5->index); 
+	            break;
+		case 7:
+		    add_stereo_pkt(audioFrame, 6, audio_st_6->codec, audio_st_6->time_base.den, audio_st_6->time_base.num, audio_st_6->index); 
+	            break;
+		case 8:	
+		    add_stereo_pkt(audioFrame, 7, audio_st_7->codec, audio_st_7->time_base.den, audio_st_7->time_base.num, audio_st_7->index); 
+	            break;
+	}
     }
     return S_OK;
 }
@@ -588,6 +595,7 @@ int usage(int status)
         "    -f <filename>        Filename raw video will be written to\n"
         "    -F <format>          Define the file format to be used\n"
         "    -c <channels>        Audio Channels (2, 8 or 16 - default is 2)\n"
+        "    -S <stereos>         Stereo Audio Stream Output (2,3,4..8 - default is 1)\n"
         "    -s <depth>           Audio Sample Depth (16 or 32 - default is 16)\n"
         "    -n <frames>          Number of frames to capture (default is unlimited)\n"
         "    -C <num>             number of card to be used\n"
@@ -643,7 +651,7 @@ int main(int argc, char *argv[])
         goto bail;
     }
     // Parse command line options
-    while ((ch = getopt(argc, argv, "?hc:s:f:a:m:n:F:C:I:")) != -1)
+    while ((ch = getopt(argc, argv, "?hc:s:f:a:m:n:S:F:C:I")) != -1)
     {
         switch (ch)
         {
@@ -668,6 +676,9 @@ int main(int argc, char *argv[])
                     goto bail;
                 }
                 break;
+ 	    case 'S':
+		g_audioStreams = atoi(optarg);
+		break;
             case 'f':
                 g_videoOutputFile = optarg;
                 break;
@@ -774,11 +785,32 @@ int main(int argc, char *argv[])
     fmt->audio_codec = CODEC_ID_PCM_S16LE;
 
     video_st = add_video_stream(oc, fmt->video_codec);
-    audio_st = add_audio_stream(oc, fmt->audio_codec,1);
-    audio_st_1 = add_audio_stream(oc, fmt->audio_codec,2);
-    audio_st_2 = add_audio_stream(oc, fmt->audio_codec,3);
-    audio_st_3 = add_audio_stream(oc, fmt->audio_codec,4);
-
+    audio_st_0 = add_audio_stream(oc, fmt->audio_codec, 1);
+	//fprintf(stderr,"Audio Stream count: %d",g_audioStreams);
+	//XXX a dirty hack for command line utility -S. need to be implemented with a container and dynamic.
+    switch(g_audioStreams){
+		case 2:	
+		    audio_st_1 = add_audio_stream(oc, fmt->audio_codec, 2);
+	            break;
+		case 3:
+		    audio_st_2 = add_audio_stream(oc, fmt->audio_codec, 3);
+	            break;
+		case 4:
+		    audio_st_3 = add_audio_stream(oc, fmt->audio_codec, 4);
+	            break;
+		case 5:	
+		    audio_st_4 = add_audio_stream(oc, fmt->audio_codec, 5);
+	            break;
+		case 6:
+		    audio_st_5 = add_audio_stream(oc, fmt->audio_codec, 6);
+	            break;
+		case 7:
+		    audio_st_6 = add_audio_stream(oc, fmt->audio_codec, 7);
+	            break;
+		case 8:	
+		    audio_st_7 = add_audio_stream(oc, fmt->audio_codec, 8);
+	            break;
+    }
     av_set_parameters(oc, NULL);
 
     if (!(fmt->flags & AVFMT_NOFILE)) {
